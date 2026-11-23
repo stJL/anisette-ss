@@ -1,0 +1,326 @@
+name: Server Health Check
+
+on:
+  schedule:
+    - cron: "0 5 * * 5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check-servers:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check servers and update README
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import json
+          import re
+          import socket
+          import ssl
+          import urllib.request
+          import urllib.error
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          TIMEOUT = 8
+          USER_AGENT = "anisette-ss-health-check/2.0"
+          MAX_BODY_BYTES = 8192
+          MAX_DETAIL_CHARS = 1400
+
+          SECRET_KEYS = {
+              "authorization", "proxy-authorization", "cookie", "set-cookie",
+              "password", "passwd", "token", "access_token", "refresh_token",
+              "id_token", "api_key", "apikey", "client_secret", "secret",
+              "session", "session_id", "sessionid", "private_key"
+          }
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              # Do not follow redirects: one configured server gets one GET only.
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          OPENER = urllib.request.build_opener(NoRedirect())
+
+          def redact_json(value):
+              if isinstance(value, dict):
+                  return {
+                      key: (
+                          "[REDACTED]"
+                          if str(key).lower().replace("-", "_") in SECRET_KEYS
+                          else redact_json(item)
+                      )
+                      for key, item in value.items()
+                  }
+              if isinstance(value, list):
+                  return [redact_json(item) for item in value]
+              return value
+
+          def sanitize(value, limit=MAX_DETAIL_CHARS):
+              text = str(value)
+              text = re.sub(
+                  r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
+                  "[REDACTED PRIVATE KEY]",
+                  text,
+                  flags=re.IGNORECASE | re.DOTALL
+              )
+              text = re.sub(
+                  r"(?im)^\s*(authorization|proxy-authorization|cookie|set-cookie)\s*:\s*[^\r\n]*",
+                  r"\1: [REDACTED]",
+                  text
+              )
+              text = re.sub(
+                  r"""(?i)\b(password|passwd|access_token|refresh_token|id_token|api_key|apikey|client_secret|secret|token|session_id|sessionid)\b(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;&}]+)""",
+                  r"\1\2[REDACTED]",
+                  text
+              )
+              text = re.sub(
+                  r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+",
+                  "Bearer [REDACTED]",
+                  text
+              )
+              text = re.sub(
+                  r"(?i)([?&](?:access_token|refresh_token|token|api_key|key|secret)=)[^&\s]+",
+                  r"\1[REDACTED]",
+                  text
+              )
+              text = re.sub(
+                  r"(https?://)[^/@\s]+:[^/@\s]+@",
+                  r"\1[REDACTED]@",
+                  text
+              )
+              text = text.replace("|", "/").replace("\r", " ").replace("\n", " ")
+              if len(text) > limit:
+                  text = text[:limit] + "… [truncated]"
+              return text.strip()
+
+          def response_body(raw):
+              decoded = raw.decode("utf-8", errors="replace")
+              try:
+                  parsed = json.loads(decoded)
+              except (ValueError, TypeError):
+                  return sanitize(decoded)
+              return sanitize(json.dumps(
+                  redact_json(parsed), ensure_ascii=False, separators=(",", ":")
+              ))
+
+          def read_limited(stream):
+              raw = stream.read(MAX_BODY_BYTES + 1)
+              truncated = len(raw) > MAX_BODY_BYTES
+              return raw[:MAX_BODY_BYTES], truncated
+
+          def body_detail(raw, truncated):
+              detail = response_body(raw) if raw else "(empty response body)"
+              if truncated:
+                  detail += " [response body truncated]"
+              return detail
+
+          def check_server(server):
+              name = server.get("name", "(unnamed server)")
+              base_url = str(server.get("address", "")).rstrip("/")
+              endpoint = base_url + "/v3/client_info"
+              print(f"Checking {name}: {base_url}")
+
+              try:
+                  request = urllib.request.Request(
+                      endpoint,
+                      headers={"User-Agent": USER_AGENT},
+                      method="GET"
+                  )
+                  with OPENER.open(request, timeout=TIMEOUT) as response:
+                      status_code = response.status
+                      content_type = response.headers.get("Content-Type", "unknown")
+                      raw, truncated = read_limited(response)
+
+                  try:
+                      payload = json.loads(raw.decode("utf-8"))
+                  except (ValueError, UnicodeDecodeError):
+                      payload = None
+
+                  if (
+                      status_code == 200
+                      and isinstance(payload, dict)
+                      and isinstance(payload.get("client_info"), str)
+                      and payload["client_info"].strip()
+                      and isinstance(payload.get("user_agent"), str)
+                      and payload["user_agent"].strip()
+                  ):
+                      return "ONLINE", (
+                          "GET /v3/client_info: HTTP 200; required fields present. "
+                          "Apple provisioning not tested."
+                      )
+
+                  return "DEGRADED", (
+                      f"GET /v3/client_info: HTTP {status_code}; "
+                      f"Content-Type: {sanitize(content_type, 160)}; "
+                      f"response: {body_detail(raw, truncated)}"
+                  )
+
+              except urllib.error.HTTPError as error:
+                  try:
+                      raw, truncated = read_limited(error)
+                      detail_body = body_detail(raw, truncated)
+                  except Exception as read_error:
+                      detail_body = (
+                          f"(could not read error response body: "
+                          f"{type(read_error).__name__}: {sanitize(read_error, 300)})"
+                      )
+
+                  location = error.headers.get("Location", "") if error.headers else ""
+                  redirect_detail = (
+                      f"; redirect target: {sanitize(location, 300)}"
+                      if 300 <= error.code < 400 and location else ""
+                  )
+                  detail = (
+                      f"HTTP ERROR {error.code} {sanitize(error.reason, 300)}"
+                      f"{redirect_detail}; response: {detail_body}"
+                  )
+
+                  if 300 <= error.code < 400 or error.code in (401, 403, 404, 429):
+                      return "UNKNOWN", detail + "; no retry or redirect follow performed."
+                  return "DEGRADED", detail
+
+              except urllib.error.URLError as error:
+                  reason = error.reason
+                  reason_text = sanitize(f"{type(reason).__name__}: {reason}", 600)
+                  if isinstance(reason, ssl.SSLCertVerificationError):
+                      return "DEGRADED", f"TLS certificate verification failed: {reason_text}"
+                  if isinstance(reason, ssl.SSLError):
+                      return "DEGRADED", f"TLS error: {reason_text}"
+                  if isinstance(reason, socket.gaierror):
+                      return "OFFLINE", f"DNS resolution failed: {reason_text}"
+                  if isinstance(reason, (socket.timeout, TimeoutError)):
+                      return "OFFLINE", f"Connection timeout: {reason_text}"
+                  if isinstance(reason, ConnectionRefusedError):
+                      return "OFFLINE", f"Connection refused: {reason_text}"
+                  if isinstance(reason, ConnectionResetError):
+                      return "OFFLINE", f"Connection reset: {reason_text}"
+                  return "DEGRADED", f"Connection error (URLError): {reason_text}"
+
+              except ssl.SSLCertVerificationError as error:
+                  return "DEGRADED", (
+                      f"TLS certificate verification failed: "
+                      f"{type(error).__name__}: {sanitize(error, 600)}"
+                  )
+              except ssl.SSLError as error:
+                  return "DEGRADED", (
+                      f"TLS error: {type(error).__name__}: {sanitize(error, 600)}"
+                  )
+              except (socket.timeout, TimeoutError) as error:
+                  return "OFFLINE", (
+                      f"Connection timeout: {type(error).__name__}: {sanitize(error, 600)}"
+                  )
+              except ConnectionRefusedError as error:
+                  return "OFFLINE", (
+                      f"Connection refused: {type(error).__name__}: {sanitize(error, 600)}"
+                  )
+              except Exception as error:
+                  return "UNKNOWN", (
+                      f"Unexpected error: {type(error).__name__}: {sanitize(error, 600)}"
+                  )
+
+          with open("servers.json", encoding="utf-8") as file:
+              servers = json.load(file)["servers"]
+
+          results = []
+          # Sequential checks: one GET per server, no retries, no IP changes.
+          for server in servers:
+              try:
+                  status, detail = check_server(server)
+              except Exception as error:
+                  status = "UNKNOWN"
+                  detail = (
+                      f"Unexpected check failure: {type(error).__name__}: "
+                      f"{sanitize(error, 600)}"
+                  )
+              results.append({
+                  "name": server.get("name", "(unnamed server)"),
+                  "url": server.get("address", ""),
+                  "status": status,
+                  "detail": detail
+              })
+              print(f"  {status}: {detail}")
+
+          checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+          lines = [
+              "<!-- SERVER_STATUS_START -->",
+              "## Server Status",
+              "",
+              f"_Last checked: {checked_at}_",
+              "",
+              "| Server | Address | Status | Details |",
+              "|---|---|---|---|"
+          ]
+
+          for item in results:
+              name = sanitize(item["name"], 160)
+              url = sanitize(item["url"], 300)
+              status = sanitize(item["status"], 40)
+              detail = sanitize(item["detail"], MAX_DETAIL_CHARS)
+              lines.append(f"| {name} | {url} | {status} | {detail} |")
+
+          lines.extend([
+              "",
+              "### Status Meanings",
+              "",
+              "- **ONLINE**: The V3 client information endpoint returned HTTP 200 with the required fields.",
+              "- **DEGRADED**: The server responded with an HTTP/API error, a TLS error, or another service-level problem.",
+              "- **OFFLINE**: DNS resolution or connection establishment failed, or the request timed out.",
+              "- **UNKNOWN**: The result was inconclusive, a redirect or access restriction was encountered, the endpoint was not exposed, or an unexpected check error occurred.",
+              "",
+              "### Health Check Limitations",
+              "",
+              "- Checks run once a week and are performed sequentially.",
+              "- Each server receives at most one HTTP GET request per run. Redirects are not followed; no retries or IP changes are performed.",
+              "- Only /v3/client_info is queried. The legacy / endpoint is intentionally not requested because it may generate one-time Anisette headers.",
+              "- /v3/get_headers and /v3/provisioning_session are never called.",
+              "- No Apple ID, credentials, cookies, or user sessions are used.",
+              "- No requests are sent to Apple. Apple authentication and provisioning are not tested.",
+              "- HTTP status codes and available response bodies are recorded. Sensitive values such as credentials, cookies, tokens, and private keys are redacted; long response bodies may be truncated.",
+              "- HTTP 401, 403, and 429 are reported as UNKNOWN rather than proof that a server is offline. Access restrictions and rate limits are respected.",
+              "",
+              "**Important:** ONLINE means only that the applicable /v3/client_info check passed. It does not mean Apple has approved the server or guarantee successful SideStore authentication.",
+              "",
+              "<!-- SERVER_STATUS_END -->"
+          ])
+
+          report = "\n".join(lines)
+          readme = Path("README.md")
+          content = readme.read_text(encoding="utf-8")
+          start_marker = "<!-- SERVER_STATUS_START -->"
+          end_marker = "<!-- SERVER_STATUS_END -->"
+
+          if (
+              start_marker in content
+              and end_marker in content
+              and content.index(start_marker) < content.index(end_marker)
+          ):
+              start = content.index(start_marker)
+              end = content.index(end_marker) + len(end_marker)
+              updated = content[:start] + report + content[end:]
+          else:
+              updated = content.rstrip() + "\n\n" + report + "\n"
+
+          readme.write_text(updated, encoding="utf-8")
+          print("README health status refreshed.")
+          PY
+
+      - name: Commit weekly README status
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add README.md
+          if git diff --cached --quiet; then
+            echo "No README changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: update weekly server health status"
+          git push
