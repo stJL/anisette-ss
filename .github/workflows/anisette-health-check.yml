@@ -1,0 +1,137 @@
+
+name: Server Health Check
+
+on:
+  schedule:
+    - cron: "17 3 * * 1" # Every Monday, 11:17 Malaysia time
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check-servers:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check servers and update README
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import json
+          import urllib.request
+          import urllib.error
+          import socket
+          import ssl
+          import time
+          from pathlib import Path
+
+          with open("servers.json", encoding="utf-8") as f:
+              servers = json.load(f)["servers"]
+
+          results = []
+
+          for server in servers:
+              name = server["name"]
+              url = server["address"].rstrip("/")
+
+              print(f"Checking {name}: {url}")
+
+              start = time.time()
+
+              try:
+                  request = urllib.request.Request(
+                      url,
+                      headers={"User-Agent": "anisette-ss-health-check/1.0"},
+                      method="GET"
+                  )
+
+                  with urllib.request.urlopen(request, timeout=15) as response:
+                      status = response.status
+                      latency = round((time.time() - start) * 1000)
+
+                      if 200 <= status < 400:
+                          result = "ONLINE"
+                      else:
+                          result = f"HTTP ERROR {status}"
+
+                      detail = f"{result} ({latency} ms)"
+
+              except urllib.error.HTTPError as e:
+                  latency = round((time.time() - start) * 1000)
+                  detail = f"HTTP ERROR {e.code} ({latency} ms)"
+
+              except Exception as e:
+                  error = str(e).replace("|", "/").replace("\n", " ")
+                  detail = f"ERROR: {type(e).__name__}: {error[:120]}"
+
+              results.append({
+                  "name": name,
+                  "url": url,
+                  "detail": detail
+              })
+
+              print(f"  {detail}")
+
+          lines = [
+              "<!-- SERVER_STATUS_START -->",
+              "## Server Status",
+              "",
+              "| Server | Address | Status |",
+              "|---|---|---|"
+          ]
+
+          for item in results:
+              name = item["name"].replace("|", "\\|")
+              url = item["url"].replace("|", "%7C")
+              detail = item["detail"].replace("|", "\\|")
+
+              lines.append(
+                  f"| {name} | {url} | {detail} |"
+              )
+
+          lines.extend([
+              "",
+              f"Last checked: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}",
+              "",
+              "<!-- SERVER_STATUS_END -->"
+          ])
+
+          report = "\n".join(lines)
+
+          readme = Path("README.md")
+          content = readme.read_text(encoding="utf-8")
+
+          start_marker = "<!-- SERVER_STATUS_START -->"
+          end_marker = "<!-- SERVER_STATUS_END -->"
+
+          if start_marker in content and end_marker in content:
+              start = content.index(start_marker)
+              end = content.index(end_marker) + len(end_marker)
+              updated = content[:start] + report + content[end:]
+          else:
+              updated = content.rstrip() + "\n\n" + report + "\n"
+
+          if updated != content:
+              readme.write_text(updated, encoding="utf-8")
+              print("README updated.")
+          else:
+              print("No changes.")
+          PY
+
+      - name: Commit README if changed
+        run: |
+          if git diff --quiet -- README.md; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add README.md
+          git commit -m "chore: update server health status"
+          git push
