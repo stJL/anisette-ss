@@ -20,3 +20,6 @@ The list is provided in JSON format and can be used as a server source for compa
 - Third-party servers are operated independently by their respective owners.
 - Server availability and reliability are not guaranteed.
 - Use third-party servers at your own discretion.
+
+<!-- SERVER_STATUS_START -->
+<!-- SERVER_STATUS_END -->
